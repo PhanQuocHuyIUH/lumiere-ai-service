@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 
 import httpx
@@ -9,9 +8,9 @@ from app.settings import settings
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-_CONCURRENCY = 5  # max concurrent embedding requests
-_dim: int = 0  # auto-detected on first successful embed call
+_COHERE_EMBED_URL = "https://api.cohere.com/v2/embed"
+_MAX_BATCH = 96  # Cohere v2 limit per request
+_dim: int = 0   # auto-detected on first successful embed call
 
 
 def get_dimension() -> int:
@@ -20,35 +19,43 @@ def get_dimension() -> int:
     return _dim
 
 
-async def embed_one(text: str) -> list[float]:
-    """Single embed via Gemini embedContent API. Auto-detects dimension on first call."""
-    global _dim
-    model = settings.embed_model
-    url = f"{_BASE_URL}/models/{model}:embedContent"
-    payload = {
-        "model": f"models/{model}",
-        "content": {"parts": [{"text": text}]},
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(url, json=payload, params={"key": settings.llm_api_key})
-        if not resp.is_success:
-            logger.error("Embedding API error %d: %s", resp.status_code, resp.text)
-            resp.raise_for_status()
-        vector: list[float] = resp.json()["embedding"]["values"]
-    if _dim == 0:
-        _dim = len(vector)
-        logger.info("Embedding dimension auto-detected: %d", _dim)
-    return vector
-
-
-async def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed multiple texts with bounded concurrency."""
+async def embed_texts(texts: list[str], input_type: str = "search_document") -> list[list[float]]:
+    """Batch embed via Cohere v2 API. Splits automatically if len > 96."""
     if not texts:
         return []
-    sem = asyncio.Semaphore(_CONCURRENCY)
 
-    async def _bounded(t: str) -> list[float]:
-        async with sem:
-            return await embed_one(t)
+    results: list[list[float]] = []
+    for i in range(0, len(texts), _MAX_BATCH):
+        batch = texts[i : i + _MAX_BATCH]
+        results.extend(await _embed_batch(batch, input_type))
+    return results
 
-    return await asyncio.gather(*[_bounded(t) for t in texts])
+
+async def _embed_batch(texts: list[str], input_type: str) -> list[list[float]]:
+    global _dim
+    payload = {
+        "texts": texts,
+        "model": settings.embed_model,
+        "input_type": input_type,
+        "embedding_types": ["float"],
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            _COHERE_EMBED_URL,
+            json=payload,
+            headers={"Authorization": f"bearer {settings.cohere_api_key}"},
+        )
+        if not resp.is_success:
+            logger.error("Cohere embedding error %d: %s", resp.status_code, resp.text)
+            resp.raise_for_status()
+        vectors: list[list[float]] = resp.json()["embeddings"]["float"]
+
+    if _dim == 0 and vectors:
+        _dim = len(vectors[0])
+        logger.info("Embedding dimension auto-detected: %d", _dim)
+    return vectors
+
+
+async def embed_one(text: str, input_type: str = "search_document") -> list[float]:
+    results = await embed_texts([text], input_type=input_type)
+    return results[0]

@@ -25,8 +25,9 @@ class Settings(BaseSettings):
     qdrant_api_key: str = Field(default="", alias="QDRANT_API_KEY")
     qdrant_collection: str = Field(default="menu_items", alias="QDRANT_COLLECTION")
 
-    # Embedding model (Gemini API — reuses llm_api_key)
-    embed_model: str = Field(default="text-embedding-004", alias="EMBED_MODEL")
+    # Embedding (Cohere API)
+    cohere_api_key: str = Field(default="", alias="COHERE_API_KEY")
+    embed_model: str = Field(default="embed-multilingual-v3.0", alias="EMBED_MODEL")
 
     # Redis (CTR store + job status)
     redis_url: str = Field(default="redis://localhost:6379", alias="REDIS_URL")

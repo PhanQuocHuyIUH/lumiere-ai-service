@@ -90,7 +90,7 @@ async def chatbot_reply(req: ChatbotRequest) -> ChatbotResponse:
     retrieved: list[dict] = []
     try:
         store = get_vector_store()
-        query_vector = await embed_one(req.message)
+        query_vector = await embed_one(req.message, input_type="search_query")
         retrieved = await store.hybrid_search_rrf(
             query_text=req.message,
             query_vector=query_vector,
