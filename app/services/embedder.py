@@ -31,7 +31,9 @@ async def embed_one(text: str) -> list[float]:
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(url, json=payload, params={"key": settings.llm_api_key})
-        resp.raise_for_status()
+        if not resp.is_success:
+            logger.error("Embedding API error %d: %s", resp.status_code, resp.text)
+            resp.raise_for_status()
         vector: list[float] = resp.json()["embedding"]["values"]
     if _dim == 0:
         _dim = len(vector)
