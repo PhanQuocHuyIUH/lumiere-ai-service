@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from app.schemas.ai import SyncMenuRequest, SyncMenuResponse
-from app.services.embedder import embed_one
+from app.services.embedder import embed_one, embed_texts
 from app.services.vector_store import get_vector_store
 from app.clients.backend import BackendExportClient, crawl_all
 
@@ -12,11 +12,9 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-async def sync_menu_item(req: SyncMenuRequest) -> SyncMenuResponse:
-    # Metadata Chunking: concatenate all semantic fields into one rich string
-    # so the embedding captures the full context of the menu item.
+def _build_full_text(req: SyncMenuRequest) -> str:
     tags_str = ", ".join(req.tags) if req.tags else ""
-    full_text = (
+    return (
         f"Tên: {req.name}, "
         f"Giá: {req.price}, "
         f"Mô tả: {req.description or ''}, "
@@ -24,8 +22,10 @@ async def sync_menu_item(req: SyncMenuRequest) -> SyncMenuResponse:
         f"Đặc tính: {tags_str}"
     )
 
-    vector = await embed_one(full_text)
 
+async def sync_menu_item(req: SyncMenuRequest) -> SyncMenuResponse:
+    full_text = _build_full_text(req)
+    vector = await embed_one(full_text)
     payload = {
         "menu_item_id": req.menu_item_id,
         "name": req.name,
@@ -35,9 +35,7 @@ async def sync_menu_item(req: SyncMenuRequest) -> SyncMenuResponse:
         "tags": req.tags,
         "full_text": full_text,
     }
-
     await get_vector_store().upsert(req.menu_item_id, vector, payload)
-
     return SyncMenuResponse(
         success=True,
         menu_item_id=req.menu_item_id,
@@ -75,9 +73,9 @@ async def sync_all_menu_items_from_backend() -> dict[str, Any]:
         logger.info("No menu items returned from backend export")
         return {"success": True, "synced_count": 0}
 
-    synced = 0
+    # ── Parse all items first ──────────────────────────────────────────────────
+    requests: list[SyncMenuRequest] = []
     for item in raw:
-        # Tolerant mapping of common field names from backend
         raw_mid = item.get("menuItemId") or item.get("menu_item_id") or item.get("id") or item.get("menuId")
         if raw_mid is None:
             continue
@@ -85,22 +83,47 @@ async def sync_all_menu_items_from_backend() -> dict[str, Any]:
             mid = int(raw_mid)
         except (TypeError, ValueError):
             continue
-
-        req_obj = {
-            "menu_item_id": mid,
-            "name": item.get("name") or item.get("title") or "",
-            "price": float(item.get("price") or 0),
-            "description": item.get("description") or item.get("desc") or "",
-            "category": item.get("category") or None,
-            "tags": item.get("tags") or [],
-        }
-
         try:
-            req = SyncMenuRequest.parse_obj(req_obj)
-            await sync_menu_item(req)
+            requests.append(SyncMenuRequest.parse_obj({
+                "menu_item_id": mid,
+                "name": item.get("name") or item.get("title") or "",
+                "price": float(item.get("price") or 0),
+                "description": item.get("description") or item.get("desc") or "",
+                "category": item.get("category") or None,
+                "tags": item.get("tags") or [],
+            }))
+        except Exception as exc:
+            logger.warning("Skipping malformed item %s: %s", raw_mid, exc)
+
+    if not requests:
+        return {"success": True, "synced_count": 0}
+
+    # ── Batch embed all full_texts in one API call (respects Cohere rate limit) ─
+    full_texts = [_build_full_text(r) for r in requests]
+    try:
+        vectors = await embed_texts(full_texts, input_type="search_document")
+    except Exception as exc:
+        logger.warning("Batch embed failed (%s) — aborting sync", exc)
+        return {"success": False, "synced_count": 0}
+
+    # ── Upsert each item with its pre-computed vector ──────────────────────────
+    store = get_vector_store()
+    synced = 0
+    for req, vector, full_text in zip(requests, vectors, full_texts):
+        try:
+            payload = {
+                "menu_item_id": req.menu_item_id,
+                "name": req.name,
+                "price": float(req.price),
+                "description": req.description or "",
+                "category": req.category or "",
+                "tags": req.tags,
+                "full_text": full_text,
+            }
+            await store.upsert(req.menu_item_id, vector, payload)
             synced += 1
         except Exception as exc:
-            logger.warning("Failed to sync menu item %s: %s", mid, exc)
+            logger.warning("Failed to upsert item %d: %s", req.menu_item_id, exc)
 
-    logger.info("Synced %d menu items from backend", synced)
+    logger.info("Synced %d/%d menu items from backend", synced, len(requests))
     return {"success": True, "synced_count": synced}

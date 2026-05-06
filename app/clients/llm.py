@@ -69,8 +69,15 @@ class OpenAICompatibleClient:
         )
 
     def _chat_completions_url(self) -> str:
-        """URL endpoint cho OpenAI-compatible providers."""
-        if urlparse(self.base_url).path.lower().rstrip("/").endswith("/openai"):
+        """URL endpoint cho OpenAI-compatible providers.
+
+        Handles three cases:
+        - base_url ends with /v1   (e.g. https://api.groq.com/openai/v1)     → append /chat/completions
+        - base_url ends with /openai (e.g. Gemini OpenAI-compat endpoint)     → append /chat/completions
+        - base_url is root          (e.g. https://api.openai.com)              → append /v1/chat/completions
+        """
+        path = urlparse(self.base_url).path.lower().rstrip("/")
+        if path.endswith("/v1") or path.endswith("/openai"):
             return f"{self.base_url}/chat/completions"
         return f"{self.base_url}/v1/chat/completions"
 
