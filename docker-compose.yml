@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant-vector-db
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT_API_KEY: ""  # Để trống cho local development, không cần auth
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    networks:
+      - lumiere-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+    driver: local
+
+networks:
+  lumiere-network:
+    driver: bridge
