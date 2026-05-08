@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     host: str = Field(default="0.0.0.0", alias="HOST")
     port: int = Field(default=8000, alias="PORT")
 
-    backend_base_url: str = Field(default="http://localhost:8080", alias="BACKEND_BASE_URL")
+    backend_base_url: str = Field(default="http://localhost:8080/api/v1", alias="BACKEND_BASE_URL")
 
     # LLM (chatbot)
     llm_provider: str = Field(default="openai_compatible", alias="LLM_PROVIDER")

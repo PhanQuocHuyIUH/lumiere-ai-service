@@ -149,7 +149,7 @@ HOST=0.0.0.0
 PORT=8001
 
 # Spring Boot backend (bắt buộc để auto-seed và export data)
-BACKEND_BASE_URL=http://localhost:8080
+BACKEND_BASE_URL=http://localhost:8080/api/v1
 
 # LLM provider (cho chatbot)
 LLM_PROVIDER=openai_compatible
