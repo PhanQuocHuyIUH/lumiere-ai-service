@@ -39,36 +39,55 @@ Service khởi động theo cơ chế **degraded mode**: nếu Qdrant hoặc LLM
 
 **Endpoint:** `POST /ai/sync-menu`
 
-Nhận thông tin món ăn từ backend, tạo vector embedding bằng mô hình `BAAI/bge-m3` (multilingual, 1024 chiều), và upsert vào Qdrant. Đây là bước nền tảng để các module khác hoạt động.
+Nhận thông tin món ăn từ backend, tạo vector embedding qua **Cohere v2 API** (model `embed-multilingual-v3.0`, 1024 chiều), và upsert vào Qdrant. Đây là bước nền tảng để các module khác hoạt động.
 
-- Embedding model: `sentence-transformers/BAAI/bge-m3`
-- Vector DB: Qdrant (collection `menu_items`)
-- Metadata lưu kèm: tên, giá, mô tả, category, tags
+- Embedding model: **Cohere `embed-multilingual-v3.0`** (gọi qua Cohere v2 API)
+- Vector DB: Qdrant (collection `menu_items`, HNSW m=16/ef_construct=200, Cosine)
+- Full-text được embed: `"Tên: {name}, Giá: {price}, Mô tả: {desc}, Danh mục: {cat}, Đặc tính: {tags}"`
+- Metadata lưu kèm: `menu_item_id`, tên, giá, mô tả, category, tags, full_text
 - **Auto-seed:** Service tự động kéo toàn bộ menu từ backend khi khởi động nếu Vector DB đang rỗng
 
 ### Module 2 — Customer Facing
 
 **`POST /ai/recommend`** — Gợi ý món ăn
 
-Tính centroid vector từ các món đang trong giỏ hàng, tìm món tương tự nhất bằng cosine similarity trên Qdrant, áp dụng penalty cho món cùng category (ưu tiên cross-sell).
+1. Lấy vector 1024-dim của từng món trong giỏ hàng từ Qdrant
+2. Tính centroid = element-wise mean của tất cả vectors
+3. Cosine similarity search với centroid (fetch top_k×3, exclude cart items)
+4. Đọc CTR từ Redis (`ai:ctr:clk / ai:ctr:imp`)
+5. Blended score = **0.6 × vector_score + 0.4 × CTR**
+6. Same-category penalty ×0.5 (ưu tiên cross-sell); `reason = "combo+popularity"` hoặc `"similar"`
 
 **`POST /ai/chatbot`** — Chatbot đặt món
 
-Pipeline RAG (Hybrid Search = vector + BM25 + RRF) để tìm món phù hợp, sau đó gửi context vào LLM với Function Calling. LLM gọi hàm `add_to_cart` khi khách muốn đặt món. Hỗ trợ tiếng Việt.
+Pipeline RAG ba bước:
+1. **Embed query** qua Cohere API (`input_type="search_query"`)
+2. **Hybrid Search RRF** (K=60): dense Qdrant search + BM25 keyword search trên toàn bộ documents → fused top 5
+3. **LLM Function Calling** với tool `add_to_cart(menu_item_id, quantity)` — timeout 15s. Tool calls → `ADD_ITEM:{id}:{qty}` actions. Hỗ trợ tiếng Việt.
 
 ### Module 3 — Back Office
 
 **`POST /ai/forecast`** — Dự báo đơn hàng / doanh thu
 
-Kéo lịch sử từ backend, xây feature matrix (lag 1-7, rolling mean/std, calendar), train LightGBM từ đầu mỗi request, dự báo đệ quy với confidence interval.
+1. Kéo lịch sử từ backend (min max(90, horizon+30) ngày)
+2. Feature engineering: lag_1..lag_7, roll_mean_7, roll_std_7, day_of_week, is_weekend, month (12 features)
+3. Ưu tiên dùng **pre-trained model** từ disk (`models/forecast_{metric}.joblib`); nếu chưa có → train LightGBM on-demand (n_estimators=150, lr=0.05, num_leaves=15)
+4. **Recursive prediction**: mỗi predicted value append vào window dùng làm lag tiếp theo
+5. Confidence interval: ±1.5 × residual_std. Cần ≥ 14 ngày dữ liệu, fallback = đường phẳng.
 
 **`POST /ai/combo-generate`** — Tạo gợi ý combo
 
-Kéo order-items trong N ngày gần nhất, chạy FP-Growth để tìm frequent itemsets, lọc association rules theo confidence và lift > 1, trả về tối đa 20 combo candidates.
+1. Ưu tiên dùng **pre-trained rules** từ disk (`models/combo_rules.pkl`) nếu có
+2. Nếu không: kéo order-items, build transaction sets (order_id → frozenset{menu_item_id})
+3. One-hot encode → FP-Growth (min_support threshold) → Association Rules (min_confidence)
+4. Lọc lift > 1.0, deduplicate bằng frozenset, tối đa 20 combos
 
 **`POST /ai/kitchen-batching`** — Tối ưu ghép lệnh bếp
 
-Dùng OR-Tools CP-SAT solver để chọn nhóm task nào nên ghép chung một lần nấu, tối đa hoá điểm số `α × T_wait + β × N_items − γ × P_penalty` trong giới hạn station capacity.
+1. Nhóm active tasks theo menu_item_id (chỉ nhóm ≥ 2 tasks)
+2. Tính score mỗi nhóm: `α(2)×T_wait + β(5)×N_tasks − γ(15)×P_penalty` (T_wait cap 60 phút, P_penalty khi vượt capacity=5)
+3. **CP-SAT solver**: maximize tổng score, constraint Σ x_i ≤ 5, timeout 0.5s
+4. Saving estimate: `min(15.0, (N−1)×avg_cook_time/60)` phút
 
 ---
 
@@ -151,7 +170,7 @@ PORT=8001
 # Spring Boot backend (bắt buộc để auto-seed và export data)
 BACKEND_BASE_URL=http://localhost:8080/api/v1
 
-# LLM provider (cho chatbot)
+# LLM provider (cho chatbot) — phải hỗ trợ OpenAI-compatible API + function calling
 LLM_PROVIDER=openai_compatible
 LLM_BASE_URL=https://api.your-llm-provider.com/v1
 LLM_API_KEY=your-llm-api-key
@@ -162,11 +181,15 @@ QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=                    # để trống nếu dùng local
 QDRANT_COLLECTION=menu_items
 
-# Embedding model (thay đổi cần xoá và tạo lại collection)
-EMBED_MODEL=BAAI/bge-m3
+# Embedding — Cohere v2 API (thay đổi EMBED_MODEL cần xoá và tạo lại Qdrant collection)
+COHERE_API_KEY=your-cohere-api-key
+EMBED_MODEL=embed-multilingual-v3.0
 
-# Redis (cho feedback + retrain)
+# Redis (cho CTR feedback + retrain job store)
 REDIS_URL=redis://localhost:6379
+
+# Thư mục lưu trained models (forecast_orders.joblib, forecast_revenue.joblib, combo_rules.pkl)
+MODEL_DIR=models
 ```
 
 ### Bước 3 — Khởi động Qdrant (local)
@@ -189,22 +212,22 @@ uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
 **Lần đầu khởi động** sẽ thực hiện theo thứ tự:
 
-1. Tải embedding model BAAI/bge-m3 (~1-2 GB, các lần sau load từ cache)
-2. Kết nối Qdrant, tạo collection `menu_items` nếu chưa có
-3. Kết nối Redis
-4. **Auto-seed:** Kiểm tra số lượng vectors trong collection. Nếu collection rỗng (lần đầu deploy hoặc sau khi xoá data), service tự động gọi `GET /internal/ai/export/menu-items` trên Spring Boot backend để kéo toàn bộ menu và upsert vào Qdrant trong background. Service vẫn khởi động bình thường, không chờ sync hoàn tất.
+1. **Kiểm tra Cohere API**: gọi `embed_one("ping")` để xác nhận COHERE_API_KEY hợp lệ và auto-detect vector dimension (1024 chiều với `embed-multilingual-v3.0`)
+2. **Kết nối Qdrant**: tạo collection `menu_items` nếu chưa có (HNSW m=16, ef_construct=200, Cosine)
+3. **Kết nối Redis**: dùng cho CTR store và job status
+4. **Auto-seed**: Nếu Qdrant collection rỗng → `asyncio.create_task(sync_all_menu_items_from_backend())` — batch embed tất cả menu items bằng Cohere API, upsert vào Qdrant. Service không chờ sync hoàn tất.
 
 Log startup thành công sẽ trông như sau:
 
 ```
-INFO  Embedder ready: model=BAAI/bge-m3  dim=1024
+INFO  Embedder ready: model=embed-multilingual-v3.0  dim=1024
 INFO  VectorStore ready: collection=menu_items  dim=1024
 INFO  Vector store is empty — triggering auto-seed from backend
 INFO  Service started: embedder=UP  vector_store=UP  redis=UP
 INFO  Synced 84 menu items from backend       ← log xuất hiện sau vài giây
 ```
 
-Nếu backend chưa chạy hoặc `BACKEND_BASE_URL` chưa cấu hình, auto-seed sẽ bị bỏ qua và log cảnh báo. Khi đó gọi thủ công bằng `POST /ai/sync-menu/full` sau khi backend sẵn sàng.
+Nếu Cohere API key không hợp lệ hoặc backend chưa chạy: service vẫn start nhưng `sync-menu` và `recommend` không khả dụng (log WARNING). Khi backend sẵn sàng, gọi thủ công `POST /ai/sync-menu/full`.
 
 **Swagger UI:** `http://localhost:8001/docs`
 
@@ -488,12 +511,13 @@ Tests dùng `TestClient` (không cần server thật), tự inject service key. 
 | Thư viện | Mục đích |
 |---|---|
 | FastAPI + Uvicorn | Web framework & ASGI server |
-| sentence-transformers | Embedding model (BAAI/bge-m3) |
-| qdrant-client | Vector database client |
-| rank-bm25 | BM25 keyword search (hybrid search) |
-| lightgbm | Time-series forecasting |
-| mlxtend | FP-Growth association rule mining |
-| ortools | CP-SAT combinatorial optimisation |
-| redis[asyncio] | Async Redis (CTR store + job store) |
-| httpx | Async HTTP client (backend + LLM calls) |
-| pandas / numpy | Data wrangling cho forecast & combo |
+| httpx | Async HTTP client — gọi Cohere API, LLM provider, backend export |
+| qdrant-client ≥ 1.11 | Async Qdrant client (HNSW vector search) |
+| rank-bm25 | BM25Okapi keyword search (hybrid search trong chatbot) |
+| lightgbm | LGBMRegressor cho time-series forecasting |
+| joblib | Save/load LightGBM model files (.joblib) |
+| mlxtend | FP-Growth + association_rules cho combo discovery |
+| ortools | CP-SAT solver cho kitchen batching |
+| redis[asyncio] | Async Redis — CTR counters (ai:ctr:*) + job status (ai:job:*) |
+| pandas / numpy | Feature engineering (forecast) và one-hot encoding (combo) |
+| pydantic-settings | Type-safe .env config |

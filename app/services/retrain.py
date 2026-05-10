@@ -45,18 +45,20 @@ async def run_retrain(job_id: str) -> None:
                 logger.info("Saved %d combo rules → %s", len(rules), path)
 
         if orders:
-            model = _train_lgbm_model(orders, "orders")
-            if model is not None:
+            trained = _train_lgbm_model(orders, "orders")
+            if trained is not None:
+                model, residual_std = trained
                 path = os.path.join(model_dir, "forecast_orders.joblib")
-                joblib.dump(model, path)
+                joblib.dump({"model": model, "residual_std": residual_std}, path)
                 saved.append("forecast_orders")
                 logger.info("Saved orders forecast model → %s", path)
 
         if payments:
-            model = _train_lgbm_model(payments, "revenue")
-            if model is not None:
+            trained = _train_lgbm_model(payments, "revenue")
+            if trained is not None:
+                model, residual_std = trained
                 path = os.path.join(model_dir, "forecast_revenue.joblib")
-                joblib.dump(model, path)
+                joblib.dump({"model": model, "residual_std": residual_std}, path)
                 saved.append("forecast_revenue")
                 logger.info("Saved revenue forecast model → %s", path)
 
@@ -131,7 +133,7 @@ def _train_combo_rules(order_items: list[dict]) -> list[dict] | None:
         return None
 
 
-def _train_lgbm_model(records: list[dict], metric: str) -> lgb.LGBMRegressor | None:
+def _train_lgbm_model(records: list[dict], metric: str) -> tuple[lgb.LGBMRegressor, float] | None:
     try:
         daily = _aggregate_daily(records, metric)
         if len(daily) < 14:
@@ -140,8 +142,8 @@ def _train_lgbm_model(records: list[dict], metric: str) -> lgb.LGBMRegressor | N
         df = _build_features(daily)
         if len(df) < 7:
             return None
-        model, _ = _train(df)
-        return model
+        model, residual_std = _train(df)
+        return model, residual_std
     except Exception as exc:
         logger.warning("Retrain LightGBM (%s) failed: %s", metric, exc)
         return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import joblib
 import lightgbm as lgb
@@ -34,15 +35,42 @@ _LGBM_PARAMS = {
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
-def _load_saved_model(metric: str) -> lgb.LGBMRegressor | None:
+def _load_saved_model(metric: str) -> tuple[lgb.LGBMRegressor, float | None] | None:
     from app.settings import settings
     path = os.path.join(settings.model_dir, f"forecast_{metric}.joblib")
     if os.path.exists(path):
         try:
-            return joblib.load(path)
+            loaded = joblib.load(path)
+            # Backward compatibility: old artifact is bare LGBMRegressor.
+            if isinstance(loaded, lgb.LGBMRegressor):
+                return loaded, None
+            # New artifact format: {"model": LGBMRegressor, "residual_std": float}
+            if isinstance(loaded, dict):
+                model = loaded.get("model")
+                residual_std = loaded.get("residual_std")
+                if isinstance(model, lgb.LGBMRegressor):
+                    return model, float(residual_std) if residual_std is not None else None
+            logger.warning("Unsupported saved forecast model artifact format for %s", metric)
         except Exception as exc:
             logger.warning("Failed to load saved forecast model for %s: %s", metric, exc)
     return None
+
+
+def _resolve_residual_std(
+    residual_std: float | None,
+    model: lgb.LGBMRegressor,
+    df: pd.DataFrame,
+) -> float:
+    if residual_std is not None and residual_std > 0:
+        return float(residual_std)
+    try:
+        X = df[_FEATURE_COLS]
+        y = df["value"].values
+        y_hat = model.predict(X)
+        return max(0.0, float(np.std(y - y_hat)))
+    except Exception as exc:
+        logger.warning("Failed to estimate residual std from saved model: %s", exc)
+        return 0.0
 
 
 async def forecast_metric(req: ForecastRequest) -> ForecastResponse:
@@ -76,10 +104,11 @@ async def forecast_metric(req: ForecastRequest) -> ForecastResponse:
         return _flat_fallback(req, daily)
 
     # Try pre-trained model first; fall back to on-demand training
-    saved_model = _load_saved_model(req.metric)
-    if saved_model is not None:
+    saved_artifact = _load_saved_model(req.metric)
+    if saved_artifact is not None:
         logger.debug("Using pre-trained model for %s forecast", req.metric)
-        residual_std = 0.0  # no residual info for saved model; intervals will be tight
+        saved_model, saved_residual_std = saved_artifact
+        residual_std = _resolve_residual_std(saved_residual_std, saved_model, df)
         predictions = _predict_future(saved_model, df, req.horizon_days, residual_std)
         return ForecastResponse(success=True, metric=req.metric, predictions=predictions)
 
@@ -196,7 +225,8 @@ def _predict_future(
             next_date.month,
         ]
 
-        raw_value = float(model.predict([x])[0])
+        x_df = pd.DataFrame([x], columns=_FEATURE_COLS)
+        raw_value = float(model.predict(x_df)[0])
         value = max(0.0, raw_value)
 
         predictions.append(

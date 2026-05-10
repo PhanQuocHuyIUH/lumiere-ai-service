@@ -91,13 +91,32 @@ async def generate_combos(req: ComboGenerateRequest) -> ComboGenerateResponse:
     records = [{mid: (mid in tx) for mid in all_items} for tx in transactions]
     df = pd.DataFrame(records, columns=all_items)
 
+    # Compute and log support threshold (absolute count) to help debug why no pairs are found
+    n_tx = len(transactions)
+    support_threshold_count = max(1, int(req.min_support * n_tx))
+    logger.info("Combo generation: transactions=%d unique_items=%d min_support=%.4f (count>=%d)",
+                n_tx, len(all_items), req.min_support, support_threshold_count)
+
+    # Try FP-Growth with requested support; if it yields only singletons (no pairs),
+    # progressively lower support (halve) down to a floor (0.001) to attempt to find pair itemsets.
+    support = float(req.min_support)
+    freq_itemsets = None
+    tried_supports = []
     try:
-        freq_itemsets = fpgrowth(df, min_support=req.min_support, use_colnames=True)
+        while support >= 0.001:
+            tried_supports.append(support)
+            freq_itemsets = fpgrowth(df, min_support=support, use_colnames=True)
+            # Keep going if we only found singletons (no itemsets of size >=2)
+            if not freq_itemsets.empty and any(len(x) >= 2 for x in freq_itemsets['itemsets']):
+                logger.info("FP-Growth found itemsets at support=%.4f (tried %s)", support, tried_supports)
+                break
+            logger.debug("FP-Growth at support=%.4f produced %d itemsets (only singletons?), lowering support", support, len(freq_itemsets))
+            support = support / 2.0
+        if freq_itemsets is None or freq_itemsets.empty:
+            logger.info("FP-Growth found no frequent itemsets (tried supports=%s)", tried_supports)
+            return ComboGenerateResponse(success=True, draft_combos=[])
     except Exception as exc:
         logger.warning("FP-Growth failed (%s)", exc)
-        return ComboGenerateResponse(success=True, draft_combos=[])
-
-    if freq_itemsets.empty:
         return ComboGenerateResponse(success=True, draft_combos=[])
 
     # ── Step 4: Association rules — filter by confidence AND Lift > 1 ─────────
