@@ -20,8 +20,8 @@ Spring Boot Backend
 │  └──────┬───────┘  └──────┬───────┘  └────┬─────┘  │
 │         │                 │               │         │
 │    Qdrant +          RAG Search +     LightGBM /   │
-│    BAAI/bge-m3       LLM Function     FP-Growth /  │
-│    (embeddings)      Calling          CP-SAT        │
+│    Cohere            LLM Function     FP-Growth /  │
+│    embed-v3.0        Calling          CP-SAT        │
 └─────────────────────────────────────────────────────┘
         │                   │
         ▼                   ▼
