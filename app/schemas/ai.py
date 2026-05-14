@@ -42,9 +42,9 @@ class RecommendItem(BaseModel):
 
 class RecommendResponse(BaseModel):
     success: bool = True
-    source: Literal["model", "fallback"]
+    source: Literal["model", "fallback", "timeout", "error"]
     items: list[RecommendItem]
-    model_version: str
+    model_version: str | None = None
 
 
 class ChatbotRequest(BaseModel):
