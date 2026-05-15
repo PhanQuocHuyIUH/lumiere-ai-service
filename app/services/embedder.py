@@ -43,7 +43,7 @@ async def _embed_batch(texts: list[str], input_type: str) -> list[list[float]]:
         resp = await client.post(
             _COHERE_EMBED_URL,
             json=payload,
-            headers={"Authorization": f"bearer {settings.cohere_api_key}"},
+            headers={"Authorization": f"Bearer {settings.cohere_api_key}"},
         )
         if not resp.is_success:
             logger.error("Cohere embedding error %d: %s", resp.status_code, resp.text)
