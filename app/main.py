@@ -46,6 +46,10 @@ async def lifespan(app: FastAPI):
     # ── Verify Gemini embedding API (auto-detects dimension) ──────────────────
     try:
         from app.services.embedder import embed_one, get_dimension
+        key_check = str(settings.cohere_api_key)
+        logger.info(f"RENDER DEBUG - Chiều dài API Key: {len(key_check)} ký tự. Bắt đầu bằng: {key_check[:4]}")
+        
+        await embed_one("ping")
         await embed_one("ping")  # sets _dim internally on first call
         dim = get_dimension()
         _embedder_ready = True
