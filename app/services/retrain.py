@@ -29,7 +29,11 @@ async def run_retrain(job_id: str) -> None:
 
         order_items = await _crawl_safe(client, "/internal/ai/export/order-items", from_date, "order items")
         orders = await _crawl_safe(client, "/internal/ai/export/orders", from_date, "orders")
-        payments = await _crawl_safe(client, "/internal/ai/export/payments", from_date, "payments")
+        # Revenue forecast must train on settled payments only; mirror runtime forecast filter.
+        payments = await _crawl_safe(
+            client, "/internal/ai/export/payments", from_date, "payments",
+            extra_params={"status": "SUCCESS"},
+        )
 
         model_dir = settings.model_dir
         os.makedirs(model_dir, exist_ok=True)
@@ -39,8 +43,7 @@ async def run_retrain(job_id: str) -> None:
             rules = _train_combo_rules(order_items)
             if rules is not None:
                 path = os.path.join(model_dir, "combo_rules.pkl")
-                with open(path, "wb") as f:
-                    pickle.dump(rules, f)
+                _atomic_write(path, lambda p: _dump_pickle(rules, p))
                 saved.append("combo_rules")
                 logger.info("Saved %d combo rules → %s", len(rules), path)
 
@@ -49,7 +52,7 @@ async def run_retrain(job_id: str) -> None:
             if trained is not None:
                 model, residual_std = trained
                 path = os.path.join(model_dir, "forecast_orders.joblib")
-                joblib.dump({"model": model, "residual_std": residual_std}, path)
+                _atomic_write(path, lambda p: joblib.dump({"model": model, "residual_std": residual_std}, p))
                 saved.append("forecast_orders")
                 logger.info("Saved orders forecast model → %s", path)
 
@@ -58,7 +61,7 @@ async def run_retrain(job_id: str) -> None:
             if trained is not None:
                 model, residual_std = trained
                 path = os.path.join(model_dir, "forecast_revenue.joblib")
-                joblib.dump({"model": model, "residual_std": residual_std}, path)
+                _atomic_write(path, lambda p: joblib.dump({"model": model, "residual_std": residual_std}, p))
                 saved.append("forecast_revenue")
                 logger.info("Saved revenue forecast model → %s", path)
 
@@ -71,11 +74,39 @@ async def run_retrain(job_id: str) -> None:
         await update_job(job_id, "FAILED", str(exc))
 
 
-async def _crawl_safe(client: BackendExportClient, path: str, from_date: str, label: str) -> list[dict]:
+def _atomic_write(final_path: str, writer) -> None:
+    """Write to ``{path}.tmp`` then ``os.replace`` onto the final path.
+
+    ``os.replace`` is atomic on POSIX and Windows: readers either see the old
+    file or the new one, never a partially-written file. Critical because the
+    runtime cache (``model_cache.load_cached``) triggers a reload as soon as the
+    file's mtime changes — without atomic swap, a request landing mid-write
+    would hit ``EOFError``/``UnpicklingError`` and cache the failure.
+    """
+    tmp_path = final_path + ".tmp"
+    writer(tmp_path)
+    os.replace(tmp_path, final_path)
+
+
+def _dump_pickle(obj, path: str) -> None:
+    with open(path, "wb") as f:
+        pickle.dump(obj, f)
+
+
+async def _crawl_safe(
+    client: BackendExportClient,
+    path: str,
+    from_date: str,
+    label: str,
+    extra_params: dict | None = None,
+) -> list[dict]:
+    params = {"fromDate": from_date}
+    if extra_params:
+        params.update(extra_params)
     try:
         records = await crawl_all(
             client, path,
-            extra_params={"fromDate": from_date},
+            extra_params=params,
             max_pages=200, page_size=500, timeout_s=10.0,
         )
         logger.info("Retrain: crawled %d %s", len(records), label)

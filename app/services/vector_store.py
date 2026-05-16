@@ -10,6 +10,7 @@ from qdrant_client.models import (
     HnswConfigDiff,
     PointIdsList,
     PointStruct,
+    QueryRequest,
     VectorParams,
 )
 from rank_bm25 import BM25Okapi
@@ -106,6 +107,43 @@ class VectorStore:
             if r_id not in exclude_set:
                 output.append({"id": r_id, "score": float(r.score), "payload": r.payload or {}})
         return output[:top_k]
+
+    async def search_vectors_batch(
+        self,
+        query_vectors: list[list[float]],
+        top_k: int,
+        exclude_ids: list[int] | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Run N vector searches in a single Qdrant HTTP round-trip.
+
+        Used by per-item recommendation retrieval: a cart with 15 items would
+        otherwise cause 15 sequential queries and easily breach the 5s budget.
+        """
+        if not query_vectors:
+            return []
+        exclude_set = set(exclude_ids or [])
+        limit = top_k + len(exclude_set)
+        requests = [
+            QueryRequest(query=vec, limit=limit, with_payload=True)
+            for vec in query_vectors
+        ]
+        responses = await self._c.query_batch_points(
+            collection_name=self._collection,
+            requests=requests,
+        )
+
+        results: list[list[dict[str, Any]]] = []
+        for resp in responses:
+            hits: list[dict[str, Any]] = []
+            for r in resp.points:
+                r_id = int(r.id)
+                if r_id in exclude_set:
+                    continue
+                hits.append({"id": r_id, "score": float(r.score), "payload": r.payload or {}})
+                if len(hits) >= top_k:
+                    break
+            results.append(hits)
+        return results
 
     async def hybrid_search_rrf(
         self,

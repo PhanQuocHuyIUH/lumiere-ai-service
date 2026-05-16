@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+
 import joblib
 import lightgbm as lgb
 import numpy as np
@@ -12,6 +13,7 @@ import pandas as pd
 
 from app.clients.backend import BackendExportClient, crawl_all
 from app.schemas.ai import ForecastPrediction, ForecastRequest, ForecastResponse
+from app.services.model_cache import load_cached
 
 logger = logging.getLogger(__name__)
 
@@ -35,25 +37,26 @@ _LGBM_PARAMS = {
 
 # ── Public entry point ─────────────────────────────────────────────────────────
 
+def _parse_forecast_artifact(loaded: Any) -> tuple[lgb.LGBMRegressor, float | None] | None:
+    # Backward compatibility: old artifact is a bare LGBMRegressor.
+    if isinstance(loaded, lgb.LGBMRegressor):
+        return loaded, None
+    # New artifact format: {"model": LGBMRegressor, "residual_std": float}
+    if isinstance(loaded, dict):
+        model = loaded.get("model")
+        residual_std = loaded.get("residual_std")
+        if isinstance(model, lgb.LGBMRegressor):
+            return model, float(residual_std) if residual_std is not None else None
+    return None
+
+
 def _load_saved_model(metric: str) -> tuple[lgb.LGBMRegressor, float | None] | None:
     from app.settings import settings
     path = os.path.join(settings.model_dir, f"forecast_{metric}.joblib")
-    if os.path.exists(path):
-        try:
-            loaded = joblib.load(path)
-            # Backward compatibility: old artifact is bare LGBMRegressor.
-            if isinstance(loaded, lgb.LGBMRegressor):
-                return loaded, None
-            # New artifact format: {"model": LGBMRegressor, "residual_std": float}
-            if isinstance(loaded, dict):
-                model = loaded.get("model")
-                residual_std = loaded.get("residual_std")
-                if isinstance(model, lgb.LGBMRegressor):
-                    return model, float(residual_std) if residual_std is not None else None
-            logger.warning("Unsupported saved forecast model artifact format for %s", metric)
-        except Exception as exc:
-            logger.warning("Failed to load saved forecast model for %s: %s", metric, exc)
-    return None
+    parsed = load_cached(path, lambda p: _parse_forecast_artifact(joblib.load(p)))
+    if parsed is None and os.path.exists(path):
+        logger.warning("Unsupported saved forecast model artifact format for %s", metric)
+    return parsed
 
 
 def _resolve_residual_std(
@@ -81,11 +84,15 @@ async def forecast_metric(req: ForecastRequest) -> ForecastResponse:
     from_date = (datetime.now(timezone.utc) - timedelta(days=history_days)).strftime("%Y-%m-%d")
 
     path = "/internal/ai/export/orders" if req.metric == "orders" else "/internal/ai/export/payments"
+    extra_params: dict[str, Any] = {"fromDate": from_date}
+    if req.metric == "revenue":
+        # Only count payments that actually settled — exclude PENDING / FAILED / REFUNDED
+        extra_params["status"] = "SUCCESS"
     try:
         records = await crawl_all(
             client,
             path,
-            extra_params={"fromDate": from_date},
+            extra_params=extra_params,
             max_pages=100,
             page_size=200,
             timeout_s=5.0,
@@ -97,7 +104,7 @@ async def forecast_metric(req: ForecastRequest) -> ForecastResponse:
     daily = _aggregate_daily(records, req.metric)
     if len(daily) < 14:
         logger.info("Insufficient history (%d days) — fallback forecast", len(daily))
-        return _flat_fallback(req, daily)
+        return _flat_fallback(req, daily if len(daily) > 0 else None)
 
     df = _build_features(daily)
     if len(df) < 7:
@@ -127,9 +134,23 @@ async def forecast_metric(req: ForecastRequest) -> ForecastResponse:
 def _aggregate_daily(records: list[dict], metric: str) -> pd.Series:
     rows = []
     for r in records:
-        raw_date = (
-            r.get("createdAt") or r.get("createdDate") or r.get("created_at") or ""
-        )
+        # Revenue lives at payment.paid_at; order count lives at order.created_at.
+        # Falls through field-name variants because BackendExportClient serializes snake_case.
+        if metric == "revenue":
+            raw_date = (
+                r.get("paid_at")
+                or r.get("paidAt")
+                or r.get("created_at")
+                or r.get("createdAt")
+                or ""
+            )
+        else:
+            raw_date = (
+                r.get("created_at")
+                or r.get("createdAt")
+                or r.get("createdDate")
+                or ""
+            )
         if not raw_date:
             continue
         try:
@@ -245,10 +266,13 @@ def _predict_future(
 # ── Fallback (insufficient data or errors) ────────────────────────────────────
 
 def _flat_fallback(req: ForecastRequest, daily: pd.Series | None = None) -> ForecastResponse:
-    if daily is not None and len(daily) >= 3:
-        base = float(daily.iloc[-min(7, len(daily)):].mean())
-    else:
-        base = 50.0 if req.metric == "orders" else 5_000_000.0
+    # Use the mean of whatever history we have — never inject magic numbers.
+    # If there is literally zero history we return success=False so the UI can
+    # surface "không đủ dữ liệu" instead of a misleading flat-line forecast.
+    if daily is None or len(daily) == 0:
+        return ForecastResponse(success=False, metric=req.metric, predictions=[])
+
+    base = float(daily.iloc[-min(7, len(daily)):].mean())
 
     predictions = [
         ForecastPrediction(

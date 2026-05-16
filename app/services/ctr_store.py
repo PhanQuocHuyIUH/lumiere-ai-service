@@ -9,6 +9,12 @@ logger = logging.getLogger(__name__)
 _IMP_KEY = "ai:ctr:imp"
 _CLK_KEY = "ai:ctr:clk"
 
+# Bayesian smoothing constant. CTR = clicks / (impressions + K).
+# K=10 means an item needs ~10 impressions before its raw click rate dominates
+# the prior of "0 clicks expected." This kills small-sample bias (1 imp / 1 clk
+# → 1.0 raw CTR but 0.091 smoothed).
+_BAYES_K = 10
+
 
 async def record_events(events: list[dict]) -> int:
     """Increment impression and click counters from a list of feedback events."""
@@ -33,7 +39,11 @@ async def record_events(events: list[dict]) -> int:
 
 
 async def get_ctr_map(item_ids: list[int]) -> dict[int, float]:
-    """Return CTR (clicks/impressions) per item id; items with no data get 0.0."""
+    """Return Bayesian-smoothed CTR per item id; items with no data get 0.0.
+
+    Smoothed CTR = clicks / (impressions + K). This prevents an item with
+    1 impression / 1 click from outranking one with 1000 impressions / 900 clicks.
+    """
     if not item_ids:
         return {}
     try:
@@ -45,7 +55,7 @@ async def get_ctr_map(item_ids: list[int]) -> dict[int, float]:
         for idx, item_id in enumerate(item_ids):
             imp = int(impressions[idx] or 0)
             clk = int(clicks[idx] or 0)
-            result[item_id] = clk / imp if imp > 0 else 0.0
+            result[item_id] = clk / (imp + _BAYES_K)
         return result
     except Exception as exc:
         logger.warning("CTR store read failed: %s", exc)

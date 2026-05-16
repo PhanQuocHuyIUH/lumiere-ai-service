@@ -47,10 +47,16 @@ class RecommendResponse(BaseModel):
     model_version: str | None = None
 
 
+class ConversationTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
 class ChatbotRequest(BaseModel):
     session_id: str
     message: str
     current_cart_item_ids: list[int] = Field(default_factory=list)
+    conversation_history: list[ConversationTurn] = Field(default_factory=list)
 
 
 class ChatbotResponse(BaseModel):
@@ -63,7 +69,9 @@ class ChatbotResponse(BaseModel):
 
 class ForecastRequest(BaseModel):
     metric: Literal["orders", "revenue"]
-    horizon_days: int = Field(ge=1, le=365)
+    # Capped at 30 days: recursive prediction with 7-day lag features compounds
+    # error rapidly past ~2-4 weeks; longer horizons produce flat-line noise.
+    horizon_days: int = Field(ge=1, le=30)
 
 
 class ForecastPrediction(BaseModel):
