@@ -3,18 +3,23 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import numpy as np
-
 from app.schemas.ai import RecommendItem, RecommendRequest, RecommendResponse
 from app.services.ctr_store import get_ctr_map
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
-MODEL_VERSION = "recommend_centroid_v1"
+MODEL_VERSION = "recommend_per_item_rrf_v2"
 
 # Items in the same category as any cart item receive this score multiplier.
 _SAME_CATEGORY_PENALTY = 0.5
+
+# Reciprocal Rank Fusion constant (Cormack et al. 2009). Matches vector_store.
+_RRF_K = 60
+
+# Weight split for the final blended score.
+_VECTOR_WEIGHT = 0.6
+_CTR_WEIGHT = 0.4
 
 
 async def recommend_items(req: RecommendRequest) -> RecommendResponse:
@@ -28,61 +33,84 @@ async def recommend_items(req: RecommendRequest) -> RecommendResponse:
         logger.warning("VectorStore unavailable for recommendation (%s)", exc)
         return RecommendResponse(success=True, source="fallback", items=[], model_version=MODEL_VERSION)
 
-    # ── Step 1: Fetch vectors for all cart items ───────────────────────────────
+    # ── Step 1: Fetch each cart item's own vector ──────────────────────────────
     cart_docs = await store.get_by_ids(req.current_items)
     if not cart_docs:
         logger.warning("No cart documents found for items: %s", req.current_items)
         return RecommendResponse(success=True, source="fallback", items=[], model_version=MODEL_VERSION)
 
-    # ── Step 2: Compute Centroid Vector (element-wise mean) ────────────────────
-    vectors = [d["vector"] for d in cart_docs if d.get("vector")]
-    if not vectors:
+    cart_vectors = [(int(d["id"]), d["vector"]) for d in cart_docs if d.get("vector")]
+    if not cart_vectors:
         logger.warning("No vectors found in cart documents")
         return RecommendResponse(success=True, source="fallback", items=[], model_version=MODEL_VERSION)
-
-    centroid: list[float] = np.mean(vectors, axis=0).tolist()
-    logger.info("Computing recommendations: cart_items=%d, top_k=%d", len(req.current_items), req.top_k)
-
-    # ── Step 3: Cosine Similarity search using centroid ────────────────────────
-    # Fetch extra results to allow for post-processing filtering
-    fetch_k = req.top_k * 3
-    raw_results = await store.search_vector(
-        query_vector=centroid,
-        top_k=fetch_k,
-        exclude_ids=req.current_items,
-    )
-
-    if not raw_results:
-        logger.warning("No results from vector search")
-        return RecommendResponse(success=True, source="fallback", items=[], model_version=MODEL_VERSION)
-
-    # ── Step 4: Blend vector score with CTR ───────────────────────────────────
-    candidate_ids = [int(r["id"]) for r in raw_results]
-    ctr_map = await get_ctr_map(candidate_ids)
 
     cart_categories: set[str] = {
         d["payload"].get("category", "") for d in cart_docs if d.get("payload")
     }
 
+    # ── Step 2: Retrieve candidates per cart item and fuse with RRF ────────────
+    # Per-item retrieval avoids the "centroid pulled between two unrelated tastes"
+    # problem: each cart item votes for its own neighborhood; the fusion step
+    # rewards items that appear near *several* cart items (true cross-sell).
+    # A single batched Qdrant call keeps latency O(1) round-trip regardless of
+    # cart size — a 15-item group order would otherwise cost 15 sequential RTTs.
+    fetch_per_item = max(req.top_k * 3, 15)
+    exclude_ids = list(req.current_items)
+    query_vectors = [vec for _, vec in cart_vectors]
+
+    batch_results = await store.search_vectors_batch(
+        query_vectors=query_vectors,
+        top_k=fetch_per_item,
+        exclude_ids=exclude_ids,
+    )
+
+    candidates: dict[int, dict[str, Any]] = {}
+    for hits in batch_results:
+        for rank, hit in enumerate(hits):
+            cand_id = int(hit["id"])
+            if cand_id not in candidates:
+                candidates[cand_id] = {
+                    "rrf": 0.0,
+                    "payload": hit["payload"],
+                    "hit_count": 0,
+                }
+            candidates[cand_id]["rrf"] += 1.0 / (_RRF_K + rank + 1)
+            candidates[cand_id]["hit_count"] += 1
+
+    if not candidates:
+        logger.warning("No results from per-item vector search")
+        return RecommendResponse(success=True, source="fallback", items=[], model_version=MODEL_VERSION)
+
+    # Normalize RRF score to [0, 1] for stable blending with CTR
+    max_rrf = max(c["rrf"] for c in candidates.values())
+    if max_rrf <= 0:
+        max_rrf = 1.0
+
+    # ── Step 3: Pull Bayesian-smoothed CTR for each candidate ──────────────────
+    candidate_ids = list(candidates.keys())
+    ctr_map = await get_ctr_map(candidate_ids)
+
+    logger.info(
+        "Computing recommendations: cart_items=%d, candidates=%d, top_k=%d",
+        len(cart_vectors), len(candidates), req.top_k,
+    )
+
+    # ── Step 4: Blend RRF and CTR, apply category penalty ─────────────────────
     scored: list[dict[str, Any]] = []
-    for r in raw_results:
-        item_id = int(r["id"])
-        item_category: str = r["payload"].get("category", "")
-        vector_score: float = float(r["score"])
-        ctr: float = ctr_map.get(item_id, 0.0)
+    for cand_id, info in candidates.items():
+        vector_score = info["rrf"] / max_rrf
+        ctr = ctr_map.get(cand_id, 0.0)
+        blended = _VECTOR_WEIGHT * vector_score + _CTR_WEIGHT * ctr
 
-        # Score = 0.6 × VectorScore + 0.4 × CTR
-        blended_score: float = 0.6 * vector_score + 0.4 * ctr
-
-        if item_category and item_category in cart_categories:
-            blended_score *= _SAME_CATEGORY_PENALTY
+        category = info["payload"].get("category", "")
+        if category and category in cart_categories:
+            blended *= _SAME_CATEGORY_PENALTY
             reason = "similar"
         else:
             reason = "combo+popularity"
 
-        scored.append({"id": item_id, "score": blended_score, "reason": reason, "payload": r["payload"]})
+        scored.append({"id": cand_id, "score": blended, "reason": reason})
 
-    # Re-rank by penalised score
     scored.sort(key=lambda x: x["score"], reverse=True)
 
     items = [

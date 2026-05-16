@@ -10,20 +10,20 @@ from mlxtend.frequent_patterns import association_rules, fpgrowth
 
 from app.clients.backend import BackendExportClient, crawl_all
 from app.schemas.ai import ComboGenerateRequest, ComboGenerateResponse, DraftCombo
+from app.services.model_cache import load_cached
 
 logger = logging.getLogger(__name__)
+
+
+def _read_pickle(path: str) -> list[dict]:
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
 def _load_saved_rules() -> list[dict] | None:
     from app.settings import settings
     path = os.path.join(settings.model_dir, "combo_rules.pkl")
-    if os.path.exists(path):
-        try:
-            with open(path, "rb") as f:
-                return pickle.load(f)
-        except Exception as exc:
-            logger.warning("Failed to load saved combo rules: %s", exc)
-    return None
+    return load_cached(path, _read_pickle)
 
 
 async def generate_combos(req: ComboGenerateRequest) -> ComboGenerateResponse:

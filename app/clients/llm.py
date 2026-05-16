@@ -282,20 +282,33 @@ class OpenAICompatibleClient:
         user_prompt: str,
         tools: list[dict[str, Any]],
         timeout_s: float,
+        history: list[dict[str, Any]] | None = None,
+        temperature: float = 0.0,
     ) -> LlmToolsResult:
         """Gọi LLM với Function Calling.
 
         Hỗ trợ Google AI Studio (Native Gemini format) và OpenAI-compatible APIs.
+        `history` là list các prior turns, mỗi phần tử có key `role` và `content`.
+        `temperature` mặc định 0.0 để giữ tính deterministic; caller có thể nâng lên
+        để tăng độ đa dạng câu trả lời khi cần.
         """
         if not self.is_configured():
             raise RuntimeError("LLM is not configured")
 
+        prior_turns: list[dict[str, Any]] = history or []
+
         if self._is_google_native():
             url = f"{self._google_generate_url()}?{urlencode({'key': self.api_key})}"
+            # Google Native: contents chỉ chứa "user"/"model" — "assistant" phải map sang "model"
+            contents: list[dict[str, Any]] = []
+            for turn in prior_turns:
+                role = "model" if turn["role"] == "assistant" else "user"
+                contents.append({"role": role, "parts": [{"text": turn["content"]}]})
+            contents.append({"role": "user", "parts": [{"text": user_prompt}]})
             payload: dict[str, Any] = {
                 "systemInstruction": {"parts": [{"text": system_prompt}]},
-                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                "generationConfig": {"temperature": 0},
+                "contents": contents,
+                "generationConfig": {"temperature": temperature},
                 "tools": self._build_google_native_tools(tools),
                 "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
             }
@@ -303,13 +316,14 @@ class OpenAICompatibleClient:
             retries_count = 3
         else:
             url = self._chat_completions_url()
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            for turn in prior_turns:
+                messages.append({"role": turn["role"], "content": turn["content"]})
+            messages.append({"role": "user", "content": user_prompt})
             payload = {
                 "model": self.model,
-                "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                "temperature": temperature,
+                "messages": messages,
                 "tools": tools,
                 "tool_choice": "auto",
             }
