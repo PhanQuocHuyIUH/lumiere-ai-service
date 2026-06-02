@@ -14,6 +14,15 @@ from app.services.model_cache import load_cached
 
 logger = logging.getLogger(__name__)
 
+# ── Tuning constants ─────────────────────────────────────────────────────────
+# Min support floor: anything below this is too noisy for combo recommendation
+# (a "combo" supported by <2% of visits is statistical noise for a restaurant).
+_MIN_SUPPORT_FLOOR = 0.02
+# Bill-level grouping: orders for the same tableId within VISIT_WINDOW_SECONDS
+# are treated as one "visit" (1 group of customers eating together) — handles
+# the common case where customers add items later in the meal.
+_VISIT_WINDOW_SECONDS = 4 * 3600  # 4 hours
+
 
 def _read_pickle(path: str) -> list[dict]:
     with open(path, "rb") as f:
@@ -24,6 +33,47 @@ def _load_saved_rules() -> list[dict] | None:
     from app.settings import settings
     path = os.path.join(settings.model_dir, "combo_rules.pkl")
     return load_cached(path, _read_pickle)
+
+
+def build_visit_transactions(raw: list[dict]) -> list[frozenset[int]]:
+    """Group order items into bill-level transactions.
+
+    A "visit" = all items ordered at the same tableId within a 4-hour window.
+    Falls back to grouping by orderId when tableId or createdAt is missing.
+    Returns frozensets of menu_item_id with size >= 2 (rule mining needs pairs).
+    """
+    visits: dict[tuple, set[int]] = {}
+    fallback: dict[str, set[int]] = {}
+
+    for item in raw:
+        raw_mid = item.get("menuItemId") or item.get("menu_item_id")
+        if raw_mid is None:
+            continue
+        try:
+            mid = int(raw_mid)
+        except (TypeError, ValueError):
+            continue
+
+        table_id = item.get("tableId") or item.get("table_id")
+        created_at = item.get("createdAt") or item.get("created_at")
+
+        if table_id and created_at:
+            try:
+                ts = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                bucket = int(ts.timestamp()) // _VISIT_WINDOW_SECONDS
+                key = (int(table_id), bucket)
+                visits.setdefault(key, set()).add(mid)
+                continue
+            except (TypeError, ValueError):
+                pass
+
+        # Fallback to orderId grouping when bill-level fields are missing
+        order_id = str(item.get("orderId") or item.get("order_id") or "")
+        if order_id:
+            fallback.setdefault(order_id, set()).add(mid)
+
+    all_sets = list(visits.values()) + list(fallback.values())
+    return [frozenset(items) for items in all_sets if len(items) >= 2]
 
 
 async def generate_combos(req: ComboGenerateRequest) -> ComboGenerateResponse:
@@ -66,54 +116,31 @@ async def generate_combos(req: ComboGenerateRequest) -> ComboGenerateResponse:
     if not raw:
         return ComboGenerateResponse(success=True, draft_combos=[])
 
-    # ── Step 2: Build transaction sets (order_id → set of menu_item_ids) ──────
-    orders: dict[str, set[int]] = {}
-    for item in raw:
-        order_id = str(item.get("orderId") or item.get("order_id") or "")
-        raw_mid = item.get("menuItemId") or item.get("menu_item_id")
-        if not order_id or raw_mid is None:
-            continue
-        try:
-            mid = int(raw_mid)
-        except (TypeError, ValueError):
-            continue
-        orders.setdefault(order_id, set()).add(mid)
-
-    # Keep only multi-item orders — single-item orders cannot produce rules
-    transactions = [frozenset(items) for items in orders.values() if len(items) >= 2]
+    # ── Step 2: Bill-level transactions (tableId + 4h bucket) ────────────────
+    transactions = build_visit_transactions(raw)
     if len(transactions) < 5:
         logger.info("Insufficient transactions (%d) for FP-Growth", len(transactions))
         return ComboGenerateResponse(success=True, draft_combos=[])
 
     all_items = sorted({mid for tx in transactions for mid in tx})
 
-    # ── Step 3: One-hot encode → FP-Growth (HNSW-style tree scan, 2 DB passes) ─
+    # ── Step 3: One-hot encode → FP-Growth ────────────────────────────────────
     records = [{mid: (mid in tx) for mid in all_items} for tx in transactions]
     df = pd.DataFrame(records, columns=all_items)
 
-    # Compute and log support threshold (absolute count) to help debug why no pairs are found
+    # Effective min_support = max(request, floor). Floor prevents noise rules.
+    support = max(float(req.min_support), _MIN_SUPPORT_FLOOR)
     n_tx = len(transactions)
-    support_threshold_count = max(1, int(req.min_support * n_tx))
-    logger.info("Combo generation: transactions=%d unique_items=%d min_support=%.4f (count>=%d)",
-                n_tx, len(all_items), req.min_support, support_threshold_count)
+    support_threshold_count = max(1, int(support * n_tx))
+    logger.info(
+        "Combo generation: transactions=%d unique_items=%d min_support=%.4f (count>=%d, floor=%.4f)",
+        n_tx, len(all_items), support, support_threshold_count, _MIN_SUPPORT_FLOOR,
+    )
 
-    # Try FP-Growth with requested support; if it yields only singletons (no pairs),
-    # progressively lower support (halve) down to a floor (0.001) to attempt to find pair itemsets.
-    support = float(req.min_support)
-    freq_itemsets = None
-    tried_supports = []
     try:
-        while support >= 0.001:
-            tried_supports.append(support)
-            freq_itemsets = fpgrowth(df, min_support=support, use_colnames=True)
-            # Keep going if we only found singletons (no itemsets of size >=2)
-            if not freq_itemsets.empty and any(len(x) >= 2 for x in freq_itemsets['itemsets']):
-                logger.info("FP-Growth found itemsets at support=%.4f (tried %s)", support, tried_supports)
-                break
-            logger.debug("FP-Growth at support=%.4f produced %d itemsets (only singletons?), lowering support", support, len(freq_itemsets))
-            support = support / 2.0
-        if freq_itemsets is None or freq_itemsets.empty:
-            logger.info("FP-Growth found no frequent itemsets (tried supports=%s)", tried_supports)
+        freq_itemsets = fpgrowth(df, min_support=support, use_colnames=True)
+        if freq_itemsets.empty or not any(len(x) >= 2 for x in freq_itemsets["itemsets"]):
+            logger.info("FP-Growth found no pair itemsets at support=%.4f", support)
             return ComboGenerateResponse(success=True, draft_combos=[])
     except Exception as exc:
         logger.warning("FP-Growth failed (%s)", exc)

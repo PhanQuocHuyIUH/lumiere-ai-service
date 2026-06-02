@@ -11,6 +11,7 @@ import pandas as pd
 from mlxtend.frequent_patterns import association_rules, fpgrowth
 
 from app.clients.backend import BackendExportClient, crawl_all
+from app.services.combo import build_visit_transactions
 from app.services.forecast import _FEATURE_COLS, _LGBM_PARAMS, _aggregate_daily, _build_features, _train
 from app.services.job_store import update_job
 from app.settings import settings
@@ -117,18 +118,9 @@ async def _crawl_safe(
 
 
 def _train_combo_rules(order_items: list[dict]) -> list[dict] | None:
-    orders: dict[str, set[int]] = {}
-    for item in order_items:
-        order_id = str(item.get("orderId") or item.get("order_id") or "")
-        raw_mid = item.get("menuItemId") or item.get("menu_item_id")
-        if not order_id or raw_mid is None:
-            continue
-        try:
-            orders.setdefault(order_id, set()).add(int(raw_mid))
-        except (TypeError, ValueError):
-            continue
-
-    transactions = [frozenset(items) for items in orders.values() if len(items) >= 2]
+    # Use the same bill-level grouping as live combo generation to keep
+    # training and runtime support distributions in sync.
+    transactions = build_visit_transactions(order_items)
     if len(transactions) < 5:
         logger.info("Retrain combo: only %d transactions — skipping", len(transactions))
         return None
@@ -138,7 +130,7 @@ def _train_combo_rules(order_items: list[dict]) -> list[dict] | None:
     df = pd.DataFrame(records, columns=all_items)
 
     try:
-        freq_itemsets = fpgrowth(df, min_support=0.03, use_colnames=True)
+        freq_itemsets = fpgrowth(df, min_support=0.02, use_colnames=True)
         if freq_itemsets.empty:
             return None
         rules = association_rules(freq_itemsets, metric="confidence", min_threshold=0.5)

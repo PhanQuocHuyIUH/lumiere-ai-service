@@ -49,6 +49,7 @@ HƯỚNG DẪN HOẠT ĐỘNG:
 2. NẾU KHÔNG CÓ MÓN: Lịch sự báo nhà hàng không phục vụ. Tuyệt đối không tự suy diễn hoặc gợi ý các món không nằm trong danh sách trên.
 3. LINH HOẠT TỪ VỰNG: Nếu khách hỏi từ khóa chung chung (ví dụ: "cơm", "bò"), hãy tự động mapping tới các món có nguyên liệu tương đương trong danh sách (như "Risotto", "Beefsteak", "Lasagna Bò").
 4. GỌI HÀM ĐẶT MÓN: Khi khách xác nhận (ok, ừ, vâng) cho một món bạn vừa gợi ý ở lượt trước, hãy gọi `add_to_cart` với ID tương ứng. Không hiển thị ID món ăn ra text.
+5. CHỈ HỖ TRỢ F&B: Nếu khách hỏi về chủ đề KHÔNG liên quan đến menu/đặt món (chính trị, lập trình, tin tức, toán, code, lời khuyên cá nhân...), lịch sự trả lời: "Em chỉ hỗ trợ về menu và đặt món tại Lumière ạ. Quý khách muốn em gợi ý món nào không?" KHÔNG được gọi add_to_cart trong trường hợp này.
 """
 
 _NO_MENU_REPLY = "Chưa có thông tin menu ạ. Quý khách vui lòng cho tôi biết món mình muốn tìm hoặc mô tả nhu cầu cụ thể hơn."
@@ -87,15 +88,32 @@ def _build_system_prompt(context_block: str) -> str:
     return _SYSTEM_TEMPLATE.format(context_block=context_block)
 
 
-def _parse_suggested_actions(tool_calls: list[dict]) -> list[str]:
+def _parse_suggested_actions(tool_calls: list[dict], allowed_ids: set[int]) -> list[str]:
+    """Convert tool_calls → ADD_ITEM action strings.
+
+    Drops any add_to_cart whose menu_item_id is not in ``allowed_ids`` — the
+    LLM may hallucinate IDs not in the retrieved context, and acting on those
+    would add fake items to the cart. allowed_ids = IDs surfaced by RAG this turn.
+    """
     actions: list[str] = []
     for tc in tool_calls:
-        if tc.get("name") == "add_to_cart":
-            args = tc.get("arguments", {})
-            mid = args.get("menu_item_id")
-            qty = int(args.get("quantity") or 1)
-            if mid is not None:
-                actions.append(f"ADD_ITEM:{mid}:{qty}")
+        if tc.get("name") != "add_to_cart":
+            continue
+        args = tc.get("arguments", {})
+        raw_mid = args.get("menu_item_id")
+        try:
+            mid = int(raw_mid)
+        except (TypeError, ValueError):
+            logger.warning("Dropping add_to_cart with non-numeric menu_item_id: %r", raw_mid)
+            continue
+        if allowed_ids and mid not in allowed_ids:
+            logger.warning(
+                "Dropping hallucinated add_to_cart: menu_item_id=%d not in retrieved context (allowed=%s)",
+                mid, sorted(allowed_ids),
+            )
+            continue
+        qty = int(args.get("quantity") or 1)
+        actions.append(f"ADD_ITEM:{mid}:{qty}")
     return actions
 
 
@@ -188,7 +206,20 @@ async def chatbot_reply(req: ChatbotRequest) -> ChatbotResponse:
         )
 
     # ── Step 3: Map tool calls → suggested_actions ────────────────────────────
-    suggested_actions = _parse_suggested_actions(result.tool_calls)
+    # allowed_ids constrains add_to_cart to items the RAG actually retrieved this
+    # turn. For ACK messages (no fresh retrieval) we trust the LLM's history-based
+    # decision since the customer is confirming a prior suggestion.
+    allowed_ids: set[int] = set()
+    if not is_ack:
+        for it in retrieved:
+            try:
+                allowed_ids.add(int(it.get("id")))
+            except (TypeError, ValueError):
+                continue
+    suggested_actions = _parse_suggested_actions(
+        result.tool_calls,
+        allowed_ids if not is_ack else set(),
+    )
     reply_text = result.reply_text or "Dạ em ghi nhận ạ!"
 
     logger.info("Chatbot response ready: session=%s  actions=%d", req.session_id, len(suggested_actions))
